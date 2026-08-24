@@ -32,32 +32,27 @@ COOKIE_BUTTON_TEXTS = [
 
 QUEST_NAME_SELECTOR = "[class*='quest-card-quest-name']"
 
-# Rate limit / cooldown config
-# Cooldown doubles each consecutive hit (60s → 120s → 240s), caps at 1 hour
-COOLDOWN_BASE = 60        # seconds for first cooldown
-COOLDOWN_MAX  = 3600      # never wait more than 1 hour
-# ====================
+# Cooldown config
+COOLDOWN_BASE = 60    # seconds, doubles each consecutive hit
+COOLDOWN_MAX  = 3600  # cap at 1 hour
 
-# Signals that the page is rate-limited / bot-challenged instead of real content
-RATE_LIMIT_SIGNALS = [
-    "429",
-    "too many requests",
-    "rate limit",
-    "access denied",
-    "cloudflare",
-    "challenge",
-    "just a moment",        # Cloudflare challenge page title
-    "checking your browser",
+# Only match these EXACT page titles — not body text (too many false positives)
+RATE_LIMIT_TITLES = [
+    "just a moment",       # Cloudflare challenge
+    "access denied",       # Hard block
+    "429 too many requests",
+    "error 429",
+    "rate limited",
+    "attention required",  # Cloudflare attention page
 ]
+# ====================
 
 
 class SiteWatcher:
     def __init__(self):
         self.sites = self.load_sites()
         self.previous_quests = {}
-        # Track consecutive rate-limit hits per site: {"zealy": count}
         self.rate_limit_hits = {}
-        # When to stop cooling down per site: {"zealy": timestamp}
         self.cooldown_until = {}
         os.makedirs(SCREENSHOTS_DIR, exist_ok=True)
         os.makedirs(HTML_DIR, exist_ok=True)
@@ -92,24 +87,21 @@ class SiteWatcher:
     # ------------------------------------------------------------------ #
 
     def is_rate_limited_page(self, page):
-        """Return True if the loaded page looks like a rate-limit / challenge screen."""
+        """
+        Only triggers on specific page TITLES that indicate a block/challenge.
+        Never checks body text — too many false positives on normal quest content.
+        Also triggers if 0 quests found AND page title is not a known Zealy title.
+        """
         try:
-            title = (page.title() or "").lower()
-            body  = (page.inner_text("body") or "").lower()[:2000]
+            title = (page.title() or "").lower().strip()
+            self.log(f"📄 Page title: '{title}'")
+            return any(sig in title for sig in RATE_LIMIT_TITLES)
         except Exception:
             return False
 
-        combined = title + " " + body
-        return any(sig in combined for sig in RATE_LIMIT_SIGNALS)
-
     def handle_rate_limit(self, site_name):
-        """
-        Called when a rate-limit / challenge page is detected.
-        Doubles cooldown each consecutive hit, alerts Telegram, returns cooldown seconds.
-        """
         hits = self.rate_limit_hits.get(site_name, 0) + 1
         self.rate_limit_hits[site_name] = hits
-
         cooldown = min(COOLDOWN_BASE * (2 ** (hits - 1)), COOLDOWN_MAX)
         resume_at = time.time() + cooldown
         self.cooldown_until[site_name] = resume_at
@@ -121,15 +113,14 @@ class SiteWatcher:
             f"Cooling down for {cooldown}s\n"
             f"Resuming at: {resume_str}"
         )
-        self.log(f"⚠️ Rate limit hit #{hits} for {site_name} — cooling down {cooldown}s")
+        self.log(f"⚠️ Rate limit hit #{hits} — cooldown {cooldown}s")
         self.send_telegram_text(msg)
         return cooldown
 
     def clear_rate_limit(self, site_name):
-        """Called on a successful scrape to reset the hit counter."""
         if self.rate_limit_hits.get(site_name, 0) > 0:
             self.log(f"✅ Rate limit cleared for {site_name}")
-            self.send_telegram_text(f"✅ Rate limit lifted — {site_name} is back to normal checking")
+            self.send_telegram_text(f"✅ Rate limit lifted — {site_name} back to normal")
         self.rate_limit_hits[site_name] = 0
         self.cooldown_until.pop(site_name, None)
 
@@ -152,8 +143,6 @@ class SiteWatcher:
 
     def scrape_and_capture(self, url, site_name, dump_html=False):
         """
-        Loads page, dismisses cookie banner, waits for DOM hydration (11s),
-        checks for rate-limit signals, extracts quest titles, screenshots.
         Returns (quests, screenshot_path, html_path, rate_limited: bool)
         """
         html_path = None
@@ -166,14 +155,14 @@ class SiteWatcher:
 
                 self.dismiss_cookie_banner(page)
 
-                # Check for rate-limit / challenge page before waiting further
+                # Check title BEFORE hydration wait — catches hard blocks immediately
                 if self.is_rate_limited_page(page):
                     screenshot_path = f"{SCREENSHOTS_DIR}/{site_name}_ratelimit_{int(time.time())}.png"
                     page.screenshot(path=screenshot_path, full_page=True)
                     browser.close()
                     return [], screenshot_path, None, True
 
-                # DOM hydration wait — friend confirmed ~11s needed for Zealy's React shell
+                # DOM hydration wait (~11s as confirmed for Zealy's React shell)
                 self.log("⏳ Waiting 11s for DOM hydration...")
                 try:
                     page.wait_for_selector(QUEST_NAME_SELECTOR, timeout=15000)
@@ -181,7 +170,7 @@ class SiteWatcher:
                     self.log("⚠️ Quest elements didn't appear within 15s, continuing anyway")
                 time.sleep(11)
 
-                # Check again after hydration (some challenges appear after JS runs)
+                # Check title again after hydration
                 if self.is_rate_limited_page(page):
                     screenshot_path = f"{SCREENSHOTS_DIR}/{site_name}_ratelimit_{int(time.time())}.png"
                     page.screenshot(path=screenshot_path, full_page=True)
@@ -214,7 +203,6 @@ class SiteWatcher:
                         html_path = f"{HTML_DIR}/{site_name}_{int(time.time())}.html"
                         with open(html_path, "w", encoding="utf-8") as f:
                             f.write(html_content)
-                        self.log(f"📄 Saved full page HTML: {html_path}")
                     except Exception as e:
                         self.log(f"⚠️ Could not dump HTML: {e}")
 
@@ -252,7 +240,7 @@ class SiteWatcher:
             with open(photo_path, "rb") as photo:
                 requests.post(url, data={"chat_id": CHAT_ID, "caption": caption},
                               files={"photo": photo}, timeout=15)
-            self.log("📱 Sent photo to Telegram")
+            self.log("📱 Sent photo")
         except Exception as e:
             self.log(f"Error sending photo: {e}")
 
@@ -260,7 +248,7 @@ class SiteWatcher:
         try:
             url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
             requests.post(url, data={"chat_id": CHAT_ID, "text": message}, timeout=15)
-            self.log("📱 Sent text to Telegram")
+            self.log("📱 Sent text")
         except Exception as e:
             self.log(f"Error sending message: {e}")
 
@@ -270,7 +258,7 @@ class SiteWatcher:
             with open(file_path, "rb") as doc:
                 requests.post(url, data={"chat_id": CHAT_ID, "caption": caption},
                               files={"document": doc}, timeout=30)
-            self.log(f"📱 Sent document to Telegram: {file_path}")
+            self.log(f"📱 Sent document: {file_path}")
         except Exception as e:
             self.log(f"Error sending document: {e}")
 
@@ -286,7 +274,7 @@ class SiteWatcher:
         self.send_telegram_text(
             "✅ Zealy Watcher Started!\n\n"
             "• DOM extraction (no OCR)\n"
-            "• 11s hydration wait\n"
+            "• 11s hydration wait (~22-25s per real check)\n"
             "• Rate limit detection + auto-cooldown\n\n"
             "Alerts when quests are added or removed."
         )
@@ -305,14 +293,14 @@ class SiteWatcher:
                 if not site_config['enabled']:
                     continue
 
-                # ---- Cooldown gate ----
+                # Cooldown gate
                 cooldown_end = self.cooldown_until.get(site_name, 0)
                 if current_time < cooldown_end:
                     remaining = int(cooldown_end - current_time)
-                    self.log(f"🕐 {site_name} cooling down — {remaining}s remaining")
+                    self.log(f"🕐 {site_name} cooling down — {remaining}s left")
                     continue
 
-                # ---- Interval gate ----
+                # Interval gate
                 last_check = site_config.get('last_check', 0) or 0
                 if current_time - last_check < site_config['interval']:
                     continue
@@ -329,22 +317,18 @@ class SiteWatcher:
                         self.log("❌ Failed to capture")
                         continue
 
-                    # ---- Rate limit handling ----
                     if rate_limited:
                         cooldown = self.handle_rate_limit(site_name)
-                        if screenshot_path:
-                            self.send_telegram(
-                                screenshot_path,
-                                f"⚠️ RATE LIMITED — {site_name}\nCooling down {cooldown}s"
-                            )
+                        self.send_telegram(
+                            screenshot_path,
+                            f"⚠️ RATE LIMITED — {site_name}\nCooling down {cooldown}s"
+                        )
                         continue
 
-                    # Successful scrape — clear any previous rate-limit state
                     self.clear_rate_limit(site_name)
 
-                    # ---- First capture ----
                     if is_first:
-                        self.log(f"📌 FIRST CAPTURE for {site_name} — {len(current_quests)} quests")
+                        self.log(f"📌 FIRST CAPTURE — {len(current_quests)} quests")
                         self.previous_quests[site_name] = current_quests
 
                         quest_text = "\n".join([f"• {q}" for q in current_quests])
@@ -359,14 +343,13 @@ class SiteWatcher:
                         else:
                             self.send_telegram(
                                 screenshot_path,
-                                f"✅ ZEALY WATCHER STARTED\n{len(current_quests)} quests found — full list below"
+                                f"✅ ZEALY WATCHER STARTED\n{len(current_quests)} quests — full list below"
                             )
                             self.send_telegram_text(quest_text)
 
                         if html_path:
-                            self.send_telegram_document(html_path, caption=f"📄 Reference HTML — {site_name}")
+                            self.send_telegram_document(html_path, caption=f"📄 HTML dump — {site_name}")
 
-                    # ---- Subsequent captures ----
                     else:
                         comparison = self.compare_quests(self.previous_quests[site_name], current_quests)
                         self.log(f"Similarity: {comparison['similarity']:.1f}% | "
