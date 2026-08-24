@@ -1,10 +1,8 @@
-FROM python:3.11-slim
+FROM mcr.microsoft.com/playwright/python:v1.47.0-jammy
 
-# System deps: Tesseract OCR binary + Chromium runtime libs
+# Tesseract OCR binary (not included in the Playwright base image)
 RUN apt-get update && apt-get install -y --no-install-recommends \
     tesseract-ocr \
-    wget \
-    gnupg \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
@@ -12,8 +10,9 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Install Chromium + its OS-level dependencies for Playwright
-RUN playwright install --with-deps chromium
+# Browsers are already present in this base image, but this ensures
+# the exact chromium build matching playwright==1.47.0 is installed.
+RUN playwright install chromium
 
 COPY . .
 
