@@ -20,19 +20,19 @@ DEFAULT_SITES = {
         "url": "https://zealy.io/cw/minebit/questboard/sprints",
         "interval": 45,
         "enabled": True,
-        "last_check": None
+        "last_check": 0
     },
     "espn": {
         "url": "https://www.espn.com",
         "interval": 300,
         "enabled": True,
-        "last_check": None
+        "last_check": 0
     },
     "bbc": {
         "url": "https://www.bbc.com/news",
         "interval": 600,
         "enabled": True,
-        "last_check": None
+        "last_check": 0
     }
 }
 
@@ -47,7 +47,12 @@ class SiteWatcher:
     def load_sites(self):
         if os.path.exists(SITES_FILE):
             with open(SITES_FILE, 'r') as f:
-                return json.load(f)
+                sites = json.load(f)
+                # Ensure all sites have last_check as a number
+                for site in sites.values():
+                    if site.get('last_check') is None:
+                        site['last_check'] = 0
+                return sites
         else:
             self.save_sites(DEFAULT_SITES)
             return DEFAULT_SITES
@@ -158,7 +163,7 @@ class SiteWatcher:
                 if not site_config['enabled']:
                     continue
                 
-                last_check = site_config.get('last_check', 0)
+                last_check = site_config.get('last_check', 0) or 0
                 if current_time - last_check < site_config['interval']:
                     continue
                 
