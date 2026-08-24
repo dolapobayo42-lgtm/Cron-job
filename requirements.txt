@@ -1,2 +1,4 @@
-playwright
-requests
+playwright==1.47.0
+Pillow==10.4.0
+pytesseract==0.3.13
+requests==2.32.3
