@@ -1,13 +1,12 @@
 import os
 import time
 import json
+import html as html_lib
+import re
 from datetime import datetime
 from playwright.sync_api import sync_playwright
-from PIL import Image
-import pytesseract
 import requests
 import glob
-import re
 
 # ====== CONFIG ======
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
@@ -17,7 +16,6 @@ SCREENSHOTS_DIR = "screenshots"
 HTML_DIR = "html_dumps"
 LOG_FILE = "watcher.log"
 
-# Only Zealy to watch
 DEFAULT_SITES = {
     "zealy": {
         "url": "https://zealy.io/cw/minebit/questboard/sprints",
@@ -28,17 +26,13 @@ DEFAULT_SITES = {
     }
 }
 
-# Common cookie-consent button text to try clicking, in order of likelihood
 COOKIE_BUTTON_TEXTS = [
-    "Accept all",
-    "Accept All",
-    "Accept all cookies",
-    "I accept",
-    "Accept",
-    "Got it",
-    "Allow all",
-    "Agree",
+    "Accept all", "Accept All", "Accept all cookies",
+    "I accept", "Accept", "Got it", "Allow all", "Agree",
 ]
+
+# The real quest-title element we confirmed from the HTML dump
+QUEST_NAME_SELECTOR = "[class*='quest-card-quest-name']"
 # ====================
 
 
@@ -51,7 +45,6 @@ class SiteWatcher:
         self.log_file = open(LOG_FILE, 'a')
 
     def log(self, message):
-        """Log message with timestamp"""
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         full_msg = f"[{timestamp}] {message}"
         print(full_msg)
@@ -76,7 +69,6 @@ class SiteWatcher:
         self.sites = sites
 
     def dismiss_cookie_banner(self, page):
-        """Try clicking common cookie-consent buttons so they don't sit over the content."""
         for text in COOKIE_BUTTON_TEXTS:
             try:
                 btn = page.get_by_text(text, exact=False).first
@@ -89,21 +81,51 @@ class SiteWatcher:
                 continue
         return False
 
-    def get_screenshot(self, url, site_name, dump_html=False):
-        """Capture screenshot (and optionally full HTML) and return paths"""
+    def scrape_and_capture(self, url, site_name, dump_html=False):
+        """
+        Loads the page, dismisses cookie banner, extracts real quest titles
+        from the DOM (no OCR), and takes a screenshot for visual confirmation.
+        Returns (quests, screenshot_path, html_path)
+        """
         html_path = None
         try:
-            self.log(f"📸 Capturing screenshot for {site_name}...")
+            self.log(f"🌐 Loading {site_name}...")
             with sync_playwright() as p:
                 browser = p.chromium.launch(headless=True)
                 page = browser.new_page(viewport={"width": 1280, "height": 1600})
                 page.goto(url, wait_until="networkidle", timeout=60000)
 
-                # Try to dismiss any cookie/consent banner before it pollutes OCR/HTML
                 self.dismiss_cookie_banner(page)
 
-                # Give the SPA extra time to swap the real board in after the shell loads
-                time.sleep(5)
+                # Wait for at least one quest card to actually appear before reading
+                try:
+                    page.wait_for_selector(QUEST_NAME_SELECTOR, timeout=15000)
+                except Exception:
+                    self.log("⚠️ Quest name elements didn't appear within 15s, continuing anyway")
+
+                time.sleep(2)
+
+                # ---- Real DOM extraction (replaces OCR) ----
+                quests = []
+                try:
+                    elements = page.query_selector_all(QUEST_NAME_SELECTOR)
+                    for el in elements:
+                        text = el.inner_text().strip()
+                        if text:
+                            text = html_lib.unescape(text)
+                            text = re.sub(r'\s+', ' ', text)
+                            quests.append(text)
+                    # de-dupe while preserving order
+                    seen = set()
+                    deduped = []
+                    for q in quests:
+                        if q not in seen:
+                            seen.add(q)
+                            deduped.append(q)
+                    quests = deduped
+                    self.log(f"📝 Extracted {len(quests)} quest titles from DOM")
+                except Exception as e:
+                    self.log(f"⚠️ DOM extraction error: {e}")
 
                 if dump_html:
                     try:
@@ -114,47 +136,19 @@ class SiteWatcher:
                         self.log(f"📄 Saved full page HTML: {html_path}")
                     except Exception as e:
                         self.log(f"⚠️ Could not dump HTML: {e}")
-                        html_path = None
 
                 screenshot_path = f"{SCREENSHOTS_DIR}/{site_name}_{int(time.time())}.png"
                 page.screenshot(path=screenshot_path, full_page=True)
                 browser.close()
+
             self.log(f"✅ Screenshot saved: {screenshot_path}")
-            return screenshot_path, html_path
+            return quests, screenshot_path, html_path
         except Exception as e:
-            self.log(f"❌ Error capturing screenshot for {site_name}: {e}")
-            self.send_telegram_text(f"❌ Screenshot Error for {site_name}:\n{str(e)}")
-            return None, None
-
-    def extract_quests(self, image_path):
-        """Extract quest text from screenshot using OCR"""
-        try:
-            self.log(f"🔍 Extracting text from screenshot using OCR...")
-            img = Image.open(image_path)
-
-            if img.mode != 'RGB':
-                img = img.convert('RGB')
-
-            text = pytesseract.image_to_string(img)
-
-            lines = text.split('\n')
-            quests = []
-            for line in lines:
-                line = line.strip()
-                if line and len(line) > 5 and len(line) < 200:
-                    quests.append(line)
-
-            quests = list(set(quests))
-            quests.sort()
-
-            self.log(f"📝 Extracted {len(quests)} text blocks from screenshot")
-            return quests
-        except Exception as e:
-            self.log(f"⚠️ OCR Error: {e}")
-            return []
+            self.log(f"❌ Error scraping {site_name}: {e}")
+            self.send_telegram_text(f"❌ Scrape Error for {site_name}:\n{str(e)}")
+            return [], None, None
 
     def compare_quests(self, old_quests, new_quests):
-        """Compare quest lists and return differences"""
         old_set = set(old_quests) if old_quests else set()
         new_set = set(new_quests) if new_quests else set()
 
@@ -168,7 +162,6 @@ class SiteWatcher:
         }
 
     def send_telegram(self, photo_path, caption="Update"):
-        """Send photo to Telegram"""
         try:
             url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendPhoto"
             with open(photo_path, "rb") as photo:
@@ -178,7 +171,6 @@ class SiteWatcher:
             self.log(f"Error sending photo: {e}")
 
     def send_telegram_text(self, message):
-        """Send text message to Telegram"""
         try:
             url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
             requests.post(url, data={"chat_id": CHAT_ID, "text": message}, timeout=15)
@@ -187,7 +179,6 @@ class SiteWatcher:
             self.log(f"Error sending message: {e}")
 
     def send_telegram_document(self, file_path, caption=""):
-        """Send a document (e.g. HTML dump) to Telegram"""
         try:
             url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendDocument"
             with open(file_path, "rb") as doc:
@@ -201,57 +192,32 @@ class SiteWatcher:
         except Exception as e:
             self.log(f"Error sending document: {e}")
 
-    def send_full_quest_list(self, quests, site_name):
-        """Send the complete quest/text list as a .txt file so nothing is truncated"""
-        try:
-            list_path = f"{HTML_DIR}/{site_name}_items_{int(time.time())}.txt"
-            with open(list_path, "w", encoding="utf-8") as f:
-                for i, q in enumerate(quests, 1):
-                    f.write(f"{i}. {q}\n")
-            self.send_telegram_document(list_path, caption=f"📋 Full {len(quests)}-item list for {site_name}")
-        except Exception as e:
-            self.log(f"Error sending full quest list: {e}")
-
     def show_dashboard(self):
-        """Display dashboard with inline buttons"""
         message = f"""
 🔍 **ZEALY WATCHER DASHBOARD**
 
-📊 Status: ✅ ACTIVE
+📊 Status: ✅ ACTIVE (DOM mode — no OCR)
 
 Site: Minebit Zealy Quest Board
 Check Interval: 30 seconds
 Last Updated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
 
 🟢 MONITORING ENABLED
-- Tracking quest changes
-- Text extraction active
+- Reading real quest titles from page DOM
 - Real-time alerts enabled
 
 Alerts will show:
 ✨ New quests added
 ❌ Quests removed
-📝 Full text of changes
 """
         self.send_telegram_text(message)
 
-    def get_latest_screenshot(self, site_name):
-        """Get the most recent screenshot for a site"""
-        screenshots = glob.glob(f"{SCREENSHOTS_DIR}/{site_name}_*.png")
-        if screenshots:
-            latest = max(screenshots, key=os.path.getctime)
-            self.log(f"Found previous screenshot: {latest}")
-            return latest
-        self.log(f"No previous screenshot for {site_name}")
-        return None
-
     def watch(self):
-        """Main watch loop"""
         self.log("=" * 60)
-        self.log("🚀 STARTING ZEALY WATCHER WITH OCR TEXT DETECTION")
+        self.log("🚀 STARTING ZEALY WATCHER — DOM EXTRACTION MODE")
         self.log("=" * 60)
 
-        self.send_telegram_text("✅ Zealy Watcher Started!\n\nMonitoring for quest changes with text extraction.\nYou will receive alerts when quests are added or removed.")
+        self.send_telegram_text("✅ Zealy Watcher Started!\n\nNow reading real quest titles directly from the page (no more OCR).\nYou will receive alerts when quests are added or removed.")
         self.show_dashboard()
 
         check_count = 0
@@ -273,7 +239,7 @@ Alerts will show:
                 time_since_check = current_time - last_check
 
                 if time_since_check < site_config['interval']:
-                    self.log(f"⏱️ {site_name}: Wait {site_config['interval'] - int(time_since_check)}s (interval: {site_config['interval']}s)")
+                    self.log(f"⏱️ {site_name}: Wait {site_config['interval'] - int(time_since_check)}s")
                     continue
 
                 self.log(f"\n🔄 CHECKING {site_name.upper()}")
@@ -282,45 +248,37 @@ Alerts will show:
                 try:
                     is_first_capture = site_name not in self.previous_quests
 
-                    screenshot_path, html_path = self.get_screenshot(
+                    current_quests, screenshot_path, html_path = self.scrape_and_capture(
                         site_config['url'], site_name, dump_html=is_first_capture
                     )
                     if not screenshot_path:
-                        self.log(f"❌ Failed to capture screenshot")
+                        self.log(f"❌ Failed to capture")
                         continue
-
-                    current_quests = self.extract_quests(screenshot_path)
-                    if not current_quests:
-                        self.log(f"⚠️ No text extracted from screenshot")
 
                     if is_first_capture:
                         self.log(f"📌 FIRST TIME CAPTURE for {site_name}")
                         self.previous_quests[site_name] = current_quests
 
-                        quest_text = "\n".join([f"• {q}" for q in current_quests[:10]])
-                        if len(current_quests) > 10:
-                            quest_text += f"\n... and {len(current_quests) - 10} more"
-
+                        quest_text = "\n".join([f"• {q}" for q in current_quests])
                         caption = f"""✅ ZEALY WATCHER STARTED
 
 Site: {site_config['description']}
 Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
 
-📝 Initial Content Captured:
-{quest_text}
+📝 Initial Quests Captured ({len(current_quests)}):
+{quest_text}"""
 
-Total items found: {len(current_quests)}"""
+                        # Telegram caption limit is 1024 chars, split if needed
+                        if len(caption) <= 1024:
+                            self.send_telegram(screenshot_path, caption)
+                        else:
+                            self.send_telegram(screenshot_path, f"✅ ZEALY WATCHER STARTED\n\n{len(current_quests)} quests found — full list below")
+                            self.send_telegram_text(quest_text)
 
-                        self.send_telegram(screenshot_path, caption)
-                        # Send the complete list so nothing is truncated
-                        self.send_full_quest_list(current_quests, site_name)
-                        # Send the raw HTML so we can find real selectors
                         if html_path:
-                            self.send_telegram_document(
-                                html_path,
-                                caption=f"📄 Full rendered HTML for {site_name} — forward this back for selector debugging"
-                            )
-                        self.log(f"✅ Initial snapshot sent with {len(current_quests)} items")
+                            self.send_telegram_document(html_path, caption=f"📄 Reference HTML for {site_name}")
+
+                        self.log(f"✅ Initial snapshot sent with {len(current_quests)} quests")
 
                     else:
                         self.log(f"Comparing with previous capture...")
@@ -342,19 +300,15 @@ Similarity: {comparison['similarity']:.1f}%
 
 """
                             if comparison['added']:
-                                alert_text += f"✨ NEW ITEMS ADDED ({len(comparison['added'])}):\n"
-                                for item in comparison['added'][:5]:
+                                alert_text += f"✨ NEW QUESTS ({len(comparison['added'])}):\n"
+                                for item in comparison['added']:
                                     alert_text += f"• {item}\n"
-                                if len(comparison['added']) > 5:
-                                    alert_text += f"... and {len(comparison['added']) - 5} more\n"
                                 alert_text += "\n"
 
                             if comparison['removed']:
-                                alert_text += f"❌ ITEMS REMOVED ({len(comparison['removed'])}):\n"
-                                for item in comparison['removed'][:5]:
+                                alert_text += f"❌ REMOVED QUESTS ({len(comparison['removed'])}):\n"
+                                for item in comparison['removed']:
                                     alert_text += f"• {item}\n"
-                                if len(comparison['removed']) > 5:
-                                    alert_text += f"... and {len(comparison['removed']) - 5} more\n"
 
                             self.send_telegram(screenshot_path, alert_text)
                             self.log(f"✅ Alert sent to Telegram")
