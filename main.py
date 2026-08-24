@@ -19,7 +19,7 @@ LOG_FILE = "watcher.log"
 # Only Zealy to watch
 DEFAULT_SITES = {
     "zealy": {
-        "url": "https://zealy.io/cw/minebit/questboard/sprints","https://zealy.io/cw/exolix/questboard/sprints",
+        "url": "https://zealy.io/cw/minebit/questboard/sprints",
         "interval": 30,
         "enabled": True,
         "last_check": 0,
