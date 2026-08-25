@@ -11,8 +11,6 @@ import requests
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
 SITES_FILE = "watched_sites.json"
-SCREENSHOTS_DIR = "screenshots"
-HTML_DIR = "html_dumps"
 LOG_FILE = "watcher.log"
 
 DEFAULT_SITES = {
@@ -31,19 +29,11 @@ COOKIE_BUTTON_TEXTS = [
 ]
 
 QUEST_NAME_SELECTOR = "[class*='quest-card-quest-name']"
-
-# Cooldown config
-COOLDOWN_BASE = 60    # seconds, doubles each consecutive hit
-COOLDOWN_MAX  = 3600  # cap at 1 hour
-
-# Only match these EXACT page titles — not body text (too many false positives)
+COOLDOWN_BASE = 60
+COOLDOWN_MAX  = 3600
 RATE_LIMIT_TITLES = [
-    "just a moment",       # Cloudflare challenge
-    "access denied",       # Hard block
-    "429 too many requests",
-    "error 429",
-    "rate limited",
-    "attention required",  # Cloudflare attention page
+    "just a moment", "access denied", "429 too many requests",
+    "error 429", "rate limited", "attention required",
 ]
 # ====================
 
@@ -54,48 +44,71 @@ class SiteWatcher:
         self.previous_quests = {}
         self.rate_limit_hits = {}
         self.cooldown_until = {}
-        os.makedirs(SCREENSHOTS_DIR, exist_ok=True)
-        os.makedirs(HTML_DIR, exist_ok=True)
+        self.playwright = None
+        self.browser = None
         self.log_file = open(LOG_FILE, 'a')
+        self.last_update_id = 0
+        self.paused = False
+        self.start_time = time.time()
+        self.check_count = 0
+        self.consecutive_errors = 0
 
-    def log(self, message):
-        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        full_msg = f"[{timestamp}] {message}"
-        print(full_msg)
-        self.log_file.write(full_msg + "\n")
+    def log(self, msg):
+        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        line = f"[{ts}] {msg}"
+        print(line, flush=True)
+        self.log_file.write(line + "\n")
         self.log_file.flush()
 
     def load_sites(self):
         if os.path.exists(SITES_FILE):
             with open(SITES_FILE, 'r') as f:
                 sites = json.load(f)
-            for site in sites.values():
-                if site.get('last_check') is None:
-                    site['last_check'] = 0
+            for s in sites.values():
+                s.setdefault('last_check', 0)
             return sites
-        else:
-            self.save_sites(DEFAULT_SITES)
-            return DEFAULT_SITES
+        self.save_sites(DEFAULT_SITES)
+        return dict(DEFAULT_SITES)
 
-    def save_sites(self, sites):
+    def save_sites(self, sites=None):
+        if sites:
+            self.sites = sites
         with open(SITES_FILE, 'w') as f:
-            json.dump(sites, f, indent=2)
-        self.sites = sites
+            json.dump(self.sites, f, indent=2)
 
     # ------------------------------------------------------------------ #
-    #  Rate limit helpers
+    #  Browser — one persistent instance for the life of the process
     # ------------------------------------------------------------------ #
 
-    def is_rate_limited_page(self, page):
-        """
-        Only triggers on specific page TITLES that indicate a block/challenge.
-        Never checks body text — too many false positives on normal quest content.
-        Also triggers if 0 quests found AND page title is not a known Zealy title.
-        """
+    def start_browser(self):
+        self.log("🚀 Launching browser...")
+        self.playwright = sync_playwright().start()
+        self.browser = self.playwright.chromium.launch(headless=True)
+        self.log("✅ Browser ready")
+
+    def stop_browser(self):
+        try:
+            if self.browser:   self.browser.close()
+            if self.playwright: self.playwright.stop()
+        except Exception:
+            pass
+        self.browser = self.playwright = None
+
+    def restart_browser(self):
+        self.log("♻️ Restarting browser...")
+        self.stop_browser()
+        time.sleep(3)
+        self.start_browser()
+
+    # ------------------------------------------------------------------ #
+    #  Rate limiting
+    # ------------------------------------------------------------------ #
+
+    def is_rate_limited(self, page):
         try:
             title = (page.title() or "").lower().strip()
-            self.log(f"📄 Page title: '{title}'")
-            return any(sig in title for sig in RATE_LIMIT_TITLES)
+            self.log(f"📄 Title: '{title}'")
+            return any(s in title for s in RATE_LIMIT_TITLES)
         except Exception:
             return False
 
@@ -103,164 +116,346 @@ class SiteWatcher:
         hits = self.rate_limit_hits.get(site_name, 0) + 1
         self.rate_limit_hits[site_name] = hits
         cooldown = min(COOLDOWN_BASE * (2 ** (hits - 1)), COOLDOWN_MAX)
-        resume_at = time.time() + cooldown
-        self.cooldown_until[site_name] = resume_at
-        resume_str = datetime.fromtimestamp(resume_at).strftime("%H:%M:%S")
-
-        msg = (
-            f"⚠️ RATE LIMIT DETECTED — {site_name}\n\n"
-            f"Hit #{hits} in a row\n"
-            f"Cooling down for {cooldown}s\n"
-            f"Resuming at: {resume_str}"
+        self.cooldown_until[site_name] = time.time() + cooldown
+        resume = datetime.fromtimestamp(self.cooldown_until[site_name]).strftime("%H:%M:%S")
+        self.send_text(
+            f"⚠️ RATE LIMIT — {site_name}\n"
+            f"Hit #{hits}\nCooling down {cooldown}s\nResumes: {resume}"
         )
-        self.log(f"⚠️ Rate limit hit #{hits} — cooldown {cooldown}s")
-        self.send_telegram_text(msg)
-        return cooldown
 
     def clear_rate_limit(self, site_name):
         if self.rate_limit_hits.get(site_name, 0) > 0:
-            self.log(f"✅ Rate limit cleared for {site_name}")
-            self.send_telegram_text(f"✅ Rate limit lifted — {site_name} back to normal")
+            self.send_text(f"✅ Rate limit cleared — {site_name} resuming")
         self.rate_limit_hits[site_name] = 0
         self.cooldown_until.pop(site_name, None)
 
     # ------------------------------------------------------------------ #
-    #  Page helpers
+    #  Scraper — one tab per check, adapts to real hydration time
     # ------------------------------------------------------------------ #
 
-    def dismiss_cookie_banner(self, page):
+    def dismiss_cookie(self, page):
         for text in COOKIE_BUTTON_TEXTS:
             try:
                 btn = page.get_by_text(text, exact=False).first
                 if btn.is_visible(timeout=1500):
                     btn.click(timeout=1500)
-                    self.log(f"🍪 Dismissed cookie banner: '{text}'")
-                    page.wait_for_timeout(1000)
+                    self.log(f"🍪 Dismissed: '{text}'")
+                    page.wait_for_timeout(800)
                     return True
             except Exception:
                 continue
         return False
 
-    def scrape_and_capture(self, url, site_name, dump_html=False):
-        """
-        Returns (quests, screenshot_path, html_path, rate_limited: bool)
-        """
-        html_path = None
+    def scrape(self, url, site_name):
+        """Returns (quests, rate_limited, duration_seconds)"""
+        page = None
+        t0 = time.time()
         try:
-            self.log(f"🌐 Loading {site_name}...")
-            with sync_playwright() as p:
-                browser = p.chromium.launch(headless=True)
-                page = browser.new_page(viewport={"width": 1280, "height": 1600})
-                page.goto(url, wait_until="networkidle", timeout=60000)
+            page = self.browser.new_page(viewport={"width": 1280, "height": 900})
 
-                self.dismiss_cookie_banner(page)
+            # 'load' fires faster than 'networkidle' on React SPAs
+            page.goto(url, wait_until="load", timeout=60000)
+            self.dismiss_cookie(page)
 
-                # Check title BEFORE hydration wait — catches hard blocks immediately
-                if self.is_rate_limited_page(page):
-                    screenshot_path = f"{SCREENSHOTS_DIR}/{site_name}_ratelimit_{int(time.time())}.png"
-                    page.screenshot(path=screenshot_path, full_page=True)
-                    browser.close()
-                    return [], screenshot_path, None, True
+            if self.is_rate_limited(page):
+                return [], True, round(time.time() - t0)
 
-                # DOM hydration wait (~11s as confirmed for Zealy's React shell)
-                self.log("⏳ Waiting 11s for DOM hydration...")
-                try:
-                    page.wait_for_selector(QUEST_NAME_SELECTOR, timeout=15000)
-                except Exception:
-                    self.log("⚠️ Quest elements didn't appear within 15s, continuing anyway")
-                time.sleep(11)
+            # Wait exactly until quests appear — no fixed sleep needed
+            self.log("⏳ Waiting for quests to render...")
+            try:
+                page.wait_for_selector(QUEST_NAME_SELECTOR, timeout=20000)
+            except Exception:
+                self.log("⚠️ Quests didn't appear in 20s, continuing anyway")
 
-                # Check title again after hydration
-                if self.is_rate_limited_page(page):
-                    screenshot_path = f"{SCREENSHOTS_DIR}/{site_name}_ratelimit_{int(time.time())}.png"
-                    page.screenshot(path=screenshot_path, full_page=True)
-                    browser.close()
-                    return [], screenshot_path, None, True
+            time.sleep(2)  # small stability buffer
 
-                # ---- DOM extraction ----
-                quests = []
-                try:
-                    elements = page.query_selector_all(QUEST_NAME_SELECTOR)
-                    for el in elements:
-                        text = el.inner_text().strip()
-                        if text:
-                            text = html_lib.unescape(text)
-                            text = re.sub(r'\s+', ' ', text)
-                            quests.append(text)
-                    seen, deduped = set(), []
-                    for q in quests:
-                        if q not in seen:
-                            seen.add(q)
-                            deduped.append(q)
-                    quests = deduped
-                    self.log(f"📝 Extracted {len(quests)} quest titles from DOM")
-                except Exception as e:
-                    self.log(f"⚠️ DOM extraction error: {e}")
+            if self.is_rate_limited(page):
+                return [], True, round(time.time() - t0)
 
-                if dump_html:
-                    try:
-                        html_content = page.content()
-                        html_path = f"{HTML_DIR}/{site_name}_{int(time.time())}.html"
-                        with open(html_path, "w", encoding="utf-8") as f:
-                            f.write(html_content)
-                    except Exception as e:
-                        self.log(f"⚠️ Could not dump HTML: {e}")
+            elements = page.query_selector_all(QUEST_NAME_SELECTOR)
+            quests, seen = [], set()
+            for el in elements:
+                text = el.inner_text().strip()
+                if text:
+                    text = re.sub(r'\s+', ' ', html_lib.unescape(text))
+                    if text not in seen:
+                        seen.add(text)
+                        quests.append(text)
 
-                screenshot_path = f"{SCREENSHOTS_DIR}/{site_name}_{int(time.time())}.png"
-                page.screenshot(path=screenshot_path, full_page=True)
-                browser.close()
-
-            self.log(f"✅ Screenshot saved: {screenshot_path}")
-            return quests, screenshot_path, html_path, False
+            duration = round(time.time() - t0)
+            self.log(f"📝 {len(quests)} quests in {duration}s")
+            return quests, False, duration
 
         except Exception as e:
-            self.log(f"❌ Error scraping {site_name}: {e}")
-            self.send_telegram_text(f"❌ Scrape Error for {site_name}:\n{str(e)}")
-            return [], None, None, False
+            raise e
+        finally:
+            if page:
+                try: page.close()
+                except Exception: pass
 
     # ------------------------------------------------------------------ #
     #  Telegram helpers
     # ------------------------------------------------------------------ #
 
-    def compare_quests(self, old_quests, new_quests):
-        old_set = set(old_quests) if old_quests else set()
-        new_set = set(new_quests) if new_quests else set()
-        added   = new_set - old_set
-        removed = old_set - new_set
-        return {
-            'added':      sorted(added),
-            'removed':    sorted(removed),
-            'similarity': len(old_set & new_set) / max(len(old_set | new_set), 1) * 100
-                          if (old_set | new_set) else 100
-        }
-
-    def send_telegram(self, photo_path, caption="Update"):
+    def send_text(self, message):
         try:
-            url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendPhoto"
-            with open(photo_path, "rb") as photo:
-                requests.post(url, data={"chat_id": CHAT_ID, "caption": caption},
-                              files={"photo": photo}, timeout=15)
-            self.log("📱 Sent photo")
+            requests.post(
+                f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
+                data={"chat_id": CHAT_ID, "text": message},
+                timeout=15
+            )
+            self.log("📱 Sent message")
         except Exception as e:
-            self.log(f"Error sending photo: {e}")
+            self.log(f"TG error: {e}")
 
-    def send_telegram_text(self, message):
+    def send_keyboard(self, message, keyboard, parse_mode="HTML"):
         try:
-            url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-            requests.post(url, data={"chat_id": CHAT_ID, "text": message}, timeout=15)
-            self.log("📱 Sent text")
+            requests.post(
+                f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
+                json={
+                    "chat_id": CHAT_ID,
+                    "text": message,
+                    "parse_mode": parse_mode,
+                    "reply_markup": {"inline_keyboard": keyboard}
+                },
+                timeout=15
+            )
         except Exception as e:
-            self.log(f"Error sending message: {e}")
+            self.log(f"TG keyboard error: {e}")
 
-    def send_telegram_document(self, file_path, caption=""):
+    def answer_callback(self, callback_id, text="✅"):
         try:
-            url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendDocument"
-            with open(file_path, "rb") as doc:
-                requests.post(url, data={"chat_id": CHAT_ID, "caption": caption},
-                              files={"document": doc}, timeout=30)
-            self.log(f"📱 Sent document: {file_path}")
-        except Exception as e:
-            self.log(f"Error sending document: {e}")
+            requests.post(
+                f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/answerCallbackQuery",
+                data={"callback_query_id": callback_id, "text": text},
+                timeout=5
+            )
+        except Exception:
+            pass
+
+    # ------------------------------------------------------------------ #
+    #  Dashboard & site list
+    # ------------------------------------------------------------------ #
+
+    def uptime_str(self):
+        secs = int(time.time() - self.start_time)
+        h, rem = divmod(secs, 3600)
+        m, s = divmod(rem, 60)
+        if h:   return f"{h}h {m}m"
+        if m:   return f"{m}m {s}s"
+        return f"{s}s"
+
+    def show_dashboard(self):
+        status = "⏸ PAUSED" if self.paused else "✅ RUNNING"
+        lines = [
+            f"🔍 <b>ZEALY WATCHER</b>",
+            f"",
+            f"Status: {status}",
+            f"Uptime: {self.uptime_str()}",
+            f"Total Checks: {self.check_count}",
+            f"",
+            f"<b>Watched Sites:</b>",
+        ]
+        for name, cfg in self.sites.items():
+            icon  = "✅" if cfg['enabled'] else "🔴"
+            count = len(self.previous_quests.get(name, []))
+            last  = cfg.get('last_check', 0) or 0
+            ago   = f"{int(time.time()-last)}s ago" if last else "never"
+            lines.append(f"  {icon} <b>{name}</b> — {count} quests — last: {ago}")
+
+        lines += [
+            "",
+            "<b>Text commands:</b>",
+            "/add &lt;name&gt; &lt;url&gt;",
+            "/remove &lt;name&gt;",
+            "/check [name]",
+        ]
+
+        keyboard = [
+            [
+                {"text": "📋 Manage Sites", "callback_data": "list_sites"},
+                {"text": "🔄 Force Check All", "callback_data": "check_all"},
+            ],
+            [
+                {"text": "⏸ Pause All" if not self.paused else "▶️ Resume",
+                 "callback_data": "pause_all" if not self.paused else "resume_all"},
+            ],
+        ]
+        self.send_keyboard("\n".join(lines), keyboard)
+
+    def show_sites_list(self):
+        if not self.sites:
+            self.send_text("No sites are being watched.\nUse /add <name> <url> to add one.")
+            return
+
+        lines = ["<b>📋 Manage Sites</b>", ""]
+        keyboard = []
+
+        for name, cfg in self.sites.items():
+            icon  = "✅" if cfg['enabled'] else "🔴"
+            count = len(self.previous_quests.get(name, []))
+            lines.append(f"{icon} <b>{name}</b> | {count} quests")
+            lines.append(f"   {cfg['url']}")
+            lines.append("")
+            keyboard.append([
+                {"text": f"{'🔴 Disable' if cfg['enabled'] else '✅ Enable'}", "callback_data": f"toggle:{name}"},
+                {"text": "🔄 Check now", "callback_data": f"check:{name}"},
+                {"text": "🗑 Remove", "callback_data": f"remove:{name}"},
+            ])
+
+        keyboard.append([{"text": "◀️ Dashboard", "callback_data": "dashboard"}])
+        self.send_keyboard("\n".join(lines), keyboard)
+
+    # ------------------------------------------------------------------ #
+    #  Telegram update polling
+    # ------------------------------------------------------------------ #
+
+    def get_updates(self):
+        try:
+            resp = requests.get(
+                f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates",
+                params={"offset": self.last_update_id + 1, "timeout": 1},
+                timeout=5
+            )
+            data = resp.json()
+            if data.get("ok"):
+                return data.get("result", [])
+        except Exception:
+            pass
+        return []
+
+    def process_updates(self):
+        for update in self.get_updates():
+            self.last_update_id = update["update_id"]
+            if "message" in update:
+                self.handle_message(update["message"])
+            elif "callback_query" in update:
+                self.handle_callback(update["callback_query"])
+
+    def handle_message(self, msg):
+        text = (msg.get("text") or "").strip()
+        if not text.startswith("/"):
+            return
+
+        parts = text.split(maxsplit=2)
+        cmd   = parts[0].lower().split("@")[0]
+
+        if cmd in ("/start", "/dashboard", "/status"):
+            self.show_dashboard()
+
+        elif cmd == "/list":
+            self.show_sites_list()
+
+        elif cmd == "/pause":
+            self.paused = True
+            self.send_text("⏸ All checks paused.\nSend /resume to continue.")
+
+        elif cmd == "/resume":
+            self.paused = False
+            self.send_text("▶️ Checks resumed.")
+
+        elif cmd == "/add":
+            if len(parts) < 3:
+                self.send_text(
+                    "Usage: /add <name> <url>\n\n"
+                    "Example:\n"
+                    "/add minebit2 https://zealy.io/cw/minebit/questboard/sprints"
+                )
+                return
+            name = parts[1].lower().strip()
+            url  = parts[2].strip()
+            if name in self.sites:
+                self.send_text(f"⚠️ '{name}' already exists.\nRemove it first: /remove {name}")
+                return
+            self.sites[name] = {
+                "url": url,
+                "interval": 10,
+                "enabled": True,
+                "last_check": 0,
+                "description": name
+            }
+            self.save_sites()
+            self.send_text(f"✅ Added '{name}'\nURL: {url}\nWill start on next check cycle.")
+
+        elif cmd == "/remove":
+            if len(parts) < 2:
+                self.send_text("Usage: /remove <name>")
+                return
+            name = parts[1].lower().strip()
+            if name not in self.sites:
+                self.send_text(f"⚠️ '{name}' not found.")
+                return
+            del self.sites[name]
+            self.previous_quests.pop(name, None)
+            self.save_sites()
+            self.send_text(f"🗑 Removed '{name}'")
+
+        elif cmd == "/check":
+            name = parts[1].lower().strip() if len(parts) > 1 else None
+            if name and name in self.sites:
+                self.sites[name]['last_check'] = 0
+                self.save_sites()
+                self.send_text(f"🔄 Force check queued for '{name}'")
+            else:
+                for n in self.sites:
+                    self.sites[n]['last_check'] = 0
+                self.save_sites()
+                self.send_text("🔄 Force check queued for all sites")
+
+        else:
+            self.send_text(
+                "📖 Commands:\n\n"
+                "/dashboard — status & controls\n"
+                "/list — manage all sites\n"
+                "/add <name> <url> — add new site\n"
+                "/remove <name> — remove site\n"
+                "/check [name] — force check now\n"
+                "/pause — pause all checks\n"
+                "/resume — resume checks"
+            )
+
+    def handle_callback(self, cb):
+        cid  = cb["id"]
+        data = cb.get("data", "")
+        self.answer_callback(cid)
+
+        if data == "dashboard":
+            self.show_dashboard()
+        elif data == "list_sites":
+            self.show_sites_list()
+        elif data == "pause_all":
+            self.paused = True
+            self.send_text("⏸ All checks paused. Use /resume to continue.")
+        elif data == "resume_all":
+            self.paused = False
+            self.send_text("▶️ Checks resumed.")
+        elif data == "check_all":
+            for n in self.sites:
+                self.sites[n]['last_check'] = 0
+            self.save_sites()
+            self.send_text("🔄 Force check queued for all sites")
+        elif data.startswith("toggle:"):
+            name = data.split(":", 1)[1]
+            if name in self.sites:
+                self.sites[name]['enabled'] = not self.sites[name]['enabled']
+                self.save_sites()
+                state = "enabled ✅" if self.sites[name]['enabled'] else "disabled 🔴"
+                self.send_text(f"'{name}' {state}")
+                self.show_sites_list()
+        elif data.startswith("check:"):
+            name = data.split(":", 1)[1]
+            if name in self.sites:
+                self.sites[name]['last_check'] = 0
+                self.save_sites()
+                self.send_text(f"🔄 Force check queued for '{name}'")
+        elif data.startswith("remove:"):
+            name = data.split(":", 1)[1]
+            if name in self.sites:
+                del self.sites[name]
+                self.previous_quests.pop(name, None)
+                self.save_sites()
+                self.send_text(f"🗑 Removed '{name}'")
+                self.show_sites_list()
 
     # ------------------------------------------------------------------ #
     #  Main loop
@@ -268,121 +463,114 @@ class SiteWatcher:
 
     def watch(self):
         self.log("=" * 60)
-        self.log("🚀 ZEALY WATCHER — DOM MODE + RATE LIMIT PROTECTION")
+        self.log("🚀 ZEALY WATCHER — PERSISTENT BROWSER + DASHBOARD")
         self.log("=" * 60)
 
-        self.send_telegram_text(
-            "✅ Zealy Watcher Started!\n\n"
-            "• DOM extraction (no OCR)\n"
-            "• 11s hydration wait (~22-25s per real check)\n"
-            "• Rate limit detection + auto-cooldown\n\n"
-            "Alerts when quests are added or removed."
+        self.start_browser()
+        self.send_text(
+            "✅ Zealy Watcher Online!\n\n"
+            "• Persistent browser (no thread exhaustion)\n"
+            "• DOM extraction — no OCR, no screenshots\n"
+            "• Smart hydration wait (adapts to page speed)\n"
+            "• Rate limit detection + cooldown\n"
+            "• Full Telegram dashboard\n\n"
+            "Send /dashboard to open controls."
         )
 
-        check_count = 0
-
         while True:
-            current_time = time.time()
-            check_count += 1
+            self.process_updates()
 
-            self.log(f"\n{'='*60}")
-            self.log(f"--- CHECK #{check_count} at {datetime.now().strftime('%H:%M:%S')} ---")
-            self.log(f"{'='*60}")
+            if not self.paused:
+                current_time = time.time()
 
-            for site_name, site_config in self.sites.items():
-                if not site_config['enabled']:
-                    continue
-
-                # Cooldown gate
-                cooldown_end = self.cooldown_until.get(site_name, 0)
-                if current_time < cooldown_end:
-                    remaining = int(cooldown_end - current_time)
-                    self.log(f"🕐 {site_name} cooling down — {remaining}s left")
-                    continue
-
-                # Interval gate
-                last_check = site_config.get('last_check', 0) or 0
-                if current_time - last_check < site_config['interval']:
-                    continue
-
-                self.log(f"\n🔄 CHECKING {site_name.upper()}")
-
-                try:
-                    is_first = site_name not in self.previous_quests
-
-                    current_quests, screenshot_path, html_path, rate_limited = \
-                        self.scrape_and_capture(site_config['url'], site_name, dump_html=is_first)
-
-                    if not screenshot_path:
-                        self.log("❌ Failed to capture")
+                for site_name, site_config in list(self.sites.items()):
+                    if not site_config['enabled']:
                         continue
 
-                    if rate_limited:
-                        cooldown = self.handle_rate_limit(site_name)
-                        self.send_telegram(
-                            screenshot_path,
-                            f"⚠️ RATE LIMITED — {site_name}\nCooling down {cooldown}s"
-                        )
+                    cooldown_end = self.cooldown_until.get(site_name, 0)
+                    if current_time < cooldown_end:
+                        self.log(f"🕐 {site_name} cooling down — {int(cooldown_end - current_time)}s left")
                         continue
 
-                    self.clear_rate_limit(site_name)
+                    last_check = site_config.get('last_check', 0) or 0
+                    if current_time - last_check < site_config['interval']:
+                        continue
 
-                    if is_first:
-                        self.log(f"📌 FIRST CAPTURE — {len(current_quests)} quests")
-                        self.previous_quests[site_name] = current_quests
+                    self.check_count += 1
+                    self.log(f"\n--- CHECK #{self.check_count} | {site_name} | {datetime.now().strftime('%H:%M:%S')} ---")
 
-                        quest_text = "\n".join([f"• {q}" for q in current_quests])
-                        caption = (
-                            f"✅ ZEALY WATCHER STARTED\n\n"
-                            f"Site: {site_config['description']}\n"
-                            f"Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
-                            f"📝 Initial Quests ({len(current_quests)}):\n{quest_text}"
-                        )
-                        if len(caption) <= 1024:
-                            self.send_telegram(screenshot_path, caption)
-                        else:
-                            self.send_telegram(
-                                screenshot_path,
-                                f"✅ ZEALY WATCHER STARTED\n{len(current_quests)} quests — full list below"
-                            )
-                            self.send_telegram_text(quest_text)
+                    try:
+                        is_first = site_name not in self.previous_quests
+                        current_quests, rate_limited, duration = self.scrape(site_config['url'], site_name)
+                        self.consecutive_errors = 0
 
-                        if html_path:
-                            self.send_telegram_document(html_path, caption=f"📄 HTML dump — {site_name}")
+                        if rate_limited:
+                            self.handle_rate_limit(site_name)
+                            continue
 
-                    else:
-                        comparison = self.compare_quests(self.previous_quests[site_name], current_quests)
-                        self.log(f"Similarity: {comparison['similarity']:.1f}% | "
-                                 f"+{len(comparison['added'])} / -{len(comparison['removed'])}")
+                        self.clear_rate_limit(site_name)
 
-                        if comparison['added'] or comparison['removed']:
-                            self.log("🚨 CHANGE DETECTED!")
+                        if is_first:
                             self.previous_quests[site_name] = current_quests
-
-                            alert = (
-                                f"🚨 ZEALY BOARD UPDATED\n\n"
-                                f"Site: {site_config['description']}\n"
-                                f"Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
+                            quest_text = "\n".join(f"• {q}" for q in current_quests)
+                            header = (
+                                f"✅ WATCHING: {site_config['description']}\n"
+                                f"Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+                                f"First check took: {duration}s\n\n"
+                                f"📝 Initial Quests ({len(current_quests)}):"
                             )
-                            if comparison['added']:
-                                alert += f"✨ NEW QUESTS ({len(comparison['added'])}):\n"
-                                alert += "\n".join(f"• {q}" for q in comparison['added']) + "\n\n"
-                            if comparison['removed']:
-                                alert += f"❌ REMOVED ({len(comparison['removed'])}):\n"
-                                alert += "\n".join(f"• {q}" for q in comparison['removed'])
+                            full = f"{header}\n{quest_text}"
+                            # Telegram message limit is 4096 chars
+                            if len(full) <= 4096:
+                                self.send_text(full)
+                            else:
+                                self.send_text(header)
+                                self.send_text(quest_text)
 
-                            self.send_telegram(screenshot_path, alert)
                         else:
-                            self.log("✅ No changes")
+                            old_set = set(self.previous_quests[site_name])
+                            new_set = set(current_quests)
+                            added   = sorted(new_set - old_set)
+                            removed = sorted(old_set - new_set)
+                            sim     = len(old_set & new_set) / max(len(old_set | new_set), 1) * 100
+                            self.log(f"Similarity: {sim:.1f}% | +{len(added)} / -{len(removed)}")
 
-                    self.sites[site_name]['last_check'] = current_time
-                    self.save_sites(self.sites)
+                            if added or removed:
+                                self.log("🚨 CHANGE DETECTED!")
+                                self.previous_quests[site_name] = current_quests
+                                alert = (
+                                    f"🚨 ZEALY BOARD UPDATED\n\n"
+                                    f"Site: {site_config['description']}\n"
+                                    f"Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
+                                )
+                                if added:
+                                    alert += f"✨ NEW QUESTS ({len(added)}):\n"
+                                    alert += "\n".join(f"• {q}" for q in added) + "\n\n"
+                                if removed:
+                                    alert += f"❌ REMOVED ({len(removed)}):\n"
+                                    alert += "\n".join(f"• {q}" for q in removed)
+                                self.send_text(alert)
+                            else:
+                                self.log("✅ No changes")
 
-                except Exception as e:
-                    self.log(f"❌ Error checking {site_name}: {e}")
-                    self.send_telegram_text(f"❌ Error checking {site_name}:\n{str(e)}")
+                        self.sites[site_name]['last_check'] = current_time
+                        self.save_sites()
 
-            time.sleep(5)
+                    except Exception as e:
+                        self.consecutive_errors += 1
+                        self.log(f"❌ Error: {e}")
+                        self.send_text(f"❌ Error checking {site_name}:\n{e}")
+
+                        if self.consecutive_errors >= 3:
+                            self.log("⚠️ 3 consecutive errors — restarting browser")
+                            self.send_text("♻️ Restarting browser due to repeated errors...")
+                            try:
+                                self.restart_browser()
+                                self.consecutive_errors = 0
+                            except Exception as re_err:
+                                self.log(f"❌ Restart failed: {re_err}")
+
+            time.sleep(3)
 
 
 def main():
@@ -390,10 +578,12 @@ def main():
     try:
         watcher.watch()
     except KeyboardInterrupt:
-        watcher.log("Watcher stopped by user")
+        watcher.log("Stopped by user")
+        watcher.stop_browser()
     except Exception as e:
-        watcher.log(f"FATAL ERROR: {e}")
-        watcher.send_telegram_text(f"🔴 WATCHER CRASHED:\n{str(e)}")
+        watcher.log(f"FATAL: {e}")
+        watcher.send_text(f"🔴 WATCHER CRASHED:\n{e}")
+        watcher.stop_browser()
 
 
 if __name__ == "__main__":
