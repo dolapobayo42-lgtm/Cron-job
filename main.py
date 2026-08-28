@@ -180,7 +180,9 @@ class SiteWatcher:
 
     def scrape(self, url, site_name):
         """
-        Returns (quests, rate_limited, duration_seconds).
+        Returns (quests, rate_limited, duration_seconds, ready).
+        `ready` is False when the quest elements never showed up in time —
+        callers must treat that as a FAILED read, not "0 quests now".
         First call: cold load + cookie dismiss.
         Subsequent calls: fast reload on the same tab — no new page, no cookie banner.
         """
@@ -197,9 +199,9 @@ class SiteWatcher:
                 if self.is_rate_limited(page):
                     try: page.close()
                     except Exception: pass
-                    return [], True, round(time.time() - t0)
+                    return [], True, round(time.time() - t0), True
 
-                self.wait_for_quests(page)
+                ready = self.wait_for_quests(page)
                 time.sleep(0.5)
                 self.pages[site_name] = page
             else:
@@ -209,18 +211,24 @@ class SiteWatcher:
                 page.reload(wait_until="load", timeout=60000)
 
                 if self.is_rate_limited(page):
-                    return [], True, round(time.time() - t0)
+                    return [], True, round(time.time() - t0), True
 
-                self.wait_for_quests(page)
+                ready = self.wait_for_quests(page)
                 time.sleep(0.5)
 
             if self.is_rate_limited(page):
-                return [], True, round(time.time() - t0)
+                return [], True, round(time.time() - t0), True
+
+            if not ready:
+                # One retry: give the SPA a bit more time before giving up.
+                self.log("⏳ Retrying wait once before treating as failed read...")
+                ready = self.wait_for_quests(page)
+                time.sleep(0.5)
 
             quests = self.extract_quests(page)
             duration = round(time.time() - t0)
-            self.log(f"📝 {len(quests)} quests in {duration}s")
-            return quests, False, duration
+            self.log(f"📝 {len(quests)} quests in {duration}s (ready={ready})")
+            return quests, False, duration, ready
 
         except Exception as e:
             # Tab is probably dead — close it so next check does a cold load
@@ -541,7 +549,7 @@ class SiteWatcher:
 
                     try:
                         is_first = site_name not in self.previous_quests
-                        current_quests, rate_limited, duration = self.scrape(site_config['url'], site_name)
+                        current_quests, rate_limited, duration, ready = self.scrape(site_config['url'], site_name)
                         self.consecutive_errors = 0
 
                         if rate_limited:
@@ -549,6 +557,22 @@ class SiteWatcher:
                             continue
 
                         self.clear_rate_limit(site_name)
+
+                        # Guard against false "everything removed" alerts caused by a
+                        # page that hadn't finished rendering when we read it.
+                        prev_count = len(self.previous_quests.get(site_name, []))
+                        suspicious_drop = (
+                            not is_first
+                            and prev_count > 0
+                            and len(current_quests) < prev_count / 2
+                        )
+                        if not ready or suspicious_drop:
+                            reason = "page not ready" if not ready else f"count dropped {prev_count}→{len(current_quests)}"
+                            self.log(f"⚠️ Skipping this read as unreliable ({reason}) — not comparing/saving")
+                            # Retry sooner instead of waiting the full interval
+                            self.sites[site_name]['last_check'] = current_time - site_config['interval'] + 15
+                            self.save_sites()
+                            continue
 
                         if is_first:
                             self.previous_quests[site_name] = current_quests
