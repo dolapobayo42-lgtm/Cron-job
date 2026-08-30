@@ -10,18 +10,18 @@ import requests
 # ====== CONFIG ======
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
-SITES_FILE = "watched_sites.json"
-LOG_FILE = "watcher.log"
 
-DEFAULT_SITES = {
-    "zealy": {
-        "url": "https://zealy.io/cw/minebit/questboard/sprints",
-        "interval": 10,
-        "enabled": True,
-        "last_check": 0,
-        "description": "Minebit Zealy Quest Board"
-    }
-}
+# IMPORTANT: Railway's local container disk is wiped on every restart/redeploy.
+# If you attach a Railway Volume (Settings → Volumes) and mount it at, say,
+# /data, set the env var DATA_DIR=/data so sites/state survive redeploys.
+# Without a volume, sites added via /add will be lost on the next restart.
+DATA_DIR = os.getenv("DATA_DIR", ".")
+SITES_FILE = os.path.join(DATA_DIR, "watched_sites.json")
+LOG_FILE = os.path.join(DATA_DIR, "watcher.log")
+HAS_PERSISTENT_STORAGE = os.getenv("DATA_DIR") is not None
+
+# Start with NO sites — add them manually via /add once the bot is running.
+DEFAULT_SITES = {}
 
 COOKIE_BUTTON_TEXTS = [
     "Accept all", "Accept All", "Accept all cookies",
@@ -309,6 +309,7 @@ class SiteWatcher:
             "", "<b>Commands:</b>",
             "/add &lt;name&gt; &lt;url&gt; — add site",
             "/remove &lt;name&gt; — remove site",
+            "/tasks [name] — show current quest list",
             "/check [name] — force check",
         ]
         keyboard = [
@@ -422,6 +423,29 @@ class SiteWatcher:
             self.save_sites()
             self.send_text(f"✅ Added '{name}'\nURL: {url}\nStarts on next cycle.")
 
+        elif cmd == "/tasks":
+            name = parts[1].lower().strip() if len(parts) > 1 else None
+            targets = [name] if name else list(self.sites.keys())
+            if name and name not in self.sites:
+                self.send_text(f"⚠️ '{name}' not found. Use /list to see sites.")
+                return
+            if not targets:
+                self.send_text("No sites yet. Use /add <name> <url> first.")
+                return
+            for n in targets:
+                quests = self.previous_quests.get(n)
+                if quests is None:
+                    self.send_text(f"📝 {n}: no data yet (hasn't completed its first check).")
+                    continue
+                header = f"📝 <b>{self.sites[n]['description']}</b> — {len(quests)} quests"
+                body = "\n".join(f"• {q}" for q in quests) if quests else "(none found)"
+                full = f"{header}\n{body}"
+                if len(full) <= 4096:
+                    self.send_keyboard(full, [])
+                else:
+                    self.send_keyboard(header, [])
+                    self.send_text(body)
+
         elif cmd == "/remove":
             if len(parts) < 2:
                 self.send_text("Usage: /remove <name>")
@@ -455,6 +479,7 @@ class SiteWatcher:
                 "/list — manage sites\n"
                 "/add <name> <url> — add site\n"
                 "/remove <name> — remove site\n"
+                "/tasks [name] — show current quest list\n"
                 "/check [name] — force check\n"
                 "/pause — pause all\n"
                 "/resume — resume"
@@ -516,12 +541,20 @@ class SiteWatcher:
         self.log("=" * 60)
 
         self.start_browser()
+        storage_note = (
+            "💾 Persistent storage: ON (DATA_DIR set)\n"
+            if HAS_PERSISTENT_STORAGE else
+            "⚠️ No persistent storage — sites added via /add WILL BE LOST on the next "
+            "restart/redeploy. Attach a Railway Volume and set env var DATA_DIR to fix this.\n"
+        )
         self.send_text(
             "✅ Zealy Watcher Online!\n\n"
             "• Persistent tabs (reload, not new page each time)\n"
             "• DOM extraction — no OCR, no screenshots\n"
             "• Rate limit detection + cooldown\n"
             "• Full Telegram dashboard\n\n"
+            f"{storage_note}\n"
+            "No sites yet — use /add <name> <url> to start tracking.\n"
             "Send /dashboard to open controls."
         )
 
