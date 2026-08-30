@@ -20,6 +20,11 @@ SITES_FILE = os.path.join(DATA_DIR, "watched_sites.json")
 LOG_FILE = os.path.join(DATA_DIR, "watcher.log")
 HAS_PERSISTENT_STORAGE = os.getenv("DATA_DIR") is not None
 
+# Headless Chromium slowly leaks memory across thousands of tab reloads on a
+# long-running process. Fully relaunching the browser periodically bounds
+# that growth so it can't OOM-kill the container. Default: every hour.
+BROWSER_RESTART_SECONDS = int(os.getenv("BROWSER_RESTART_SECONDS", "3600"))
+
 # Start with NO sites — add them manually via /add once the bot is running.
 DEFAULT_SITES = {}
 
@@ -53,6 +58,7 @@ class SiteWatcher:
         self.start_time = time.time()
         self.check_count = 0
         self.consecutive_errors = 0
+        self.browser_started_at = 0
 
     def log(self, msg):
         ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -90,6 +96,7 @@ class SiteWatcher:
         self.playwright = sync_playwright().start()
         self.browser = self.playwright.chromium.launch(headless=True)
         self.pages = {}
+        self.browser_started_at = time.time()
         self.log("✅ Browser ready")
 
     def stop_browser(self):
@@ -564,6 +571,10 @@ class SiteWatcher:
 
         while True:
             self.process_updates()
+
+            if self.browser and time.time() - self.browser_started_at > BROWSER_RESTART_SECONDS:
+                self.log(f"🔁 Scheduled browser restart (running {BROWSER_RESTART_SECONDS//60}min) — bounding memory growth")
+                self.restart_browser()
 
             if not self.paused:
                 current_time = time.time()
