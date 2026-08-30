@@ -63,16 +63,20 @@ class SiteWatcher:
 
     def load_sites(self):
         if os.path.exists(SITES_FILE):
-            with open(SITES_FILE, 'r') as f:
-                sites = json.load(f)
-            for s in sites.values():
-                s.setdefault('last_check', 0)
-            return sites
-        self.save_sites(DEFAULT_SITES)
+            try:
+                with open(SITES_FILE, 'r') as f:
+                    sites = json.load(f)
+                for s in sites.values():
+                    s.setdefault('last_check', 0)
+                return sites
+            except (json.JSONDecodeError, ValueError) as e:
+                self.log(f"⚠️ {SITES_FILE} is empty/corrupt ({e}) — resetting to empty site list")
+                # fall through to recreate a clean file below
+        self.save_sites(dict(DEFAULT_SITES))
         return dict(DEFAULT_SITES)
 
     def save_sites(self, sites=None):
-        if sites:
+        if sites is not None:
             self.sites = sites
         with open(SITES_FILE, 'w') as f:
             json.dump(self.sites, f, indent=2)
