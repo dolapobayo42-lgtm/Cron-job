@@ -58,6 +58,7 @@ class SiteWatcher:
         self.start_time = time.time()
         self.check_count = 0
         self.consecutive_errors = 0
+        self.site_errors = {}
         self.browser_started_at = 0
 
     def log(self, msg):
@@ -599,6 +600,7 @@ class SiteWatcher:
                         is_first = site_name not in self.previous_quests
                         current_quests, rate_limited, duration, ready = self.scrape(site_config['url'], site_name)
                         self.consecutive_errors = 0
+                        self.site_errors[site_name] = 0
 
                         if rate_limited:
                             self.handle_rate_limit(site_name)
@@ -669,8 +671,17 @@ class SiteWatcher:
 
                     except Exception as e:
                         self.consecutive_errors += 1
-                        self.log(f"❌ Error: {e}")
-                        self.send_text(f"❌ Error checking {site_name}:\n{e}")
+                        self.site_errors[site_name] = self.site_errors.get(site_name, 0) + 1
+                        fails = self.site_errors[site_name]
+
+                        # Crashed/dead tabs already self-heal: scrape() closes the
+                        # tab on any exception, so the next check for this site
+                        # does a fresh cold load automatically. Only page Telegram
+                        # once a site keeps failing even after fresh reloads —
+                        # that's a real problem, not routine crash-and-recover.
+                        self.log(f"❌ Error ({fails}x in a row): {e}")
+                        if fails >= 3:
+                            self.send_text(f"❌ {site_name} failed {fails} checks in a row (even after fresh reloads):\n{e}")
 
                         if self.consecutive_errors >= 3:
                             self.log("⚠️ 3 consecutive errors — restarting browser")
@@ -699,3 +710,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
