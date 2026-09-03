@@ -66,6 +66,8 @@ class SiteWatcher:
         self.consecutive_errors = 0
         self.site_errors = {}
         self.browser_started_at = 0
+        self.cycle_start = 0
+        self.cycle_checked = set()
 
     def log(self, msg):
         ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -710,6 +712,18 @@ class SiteWatcher:
                         self.sites[site_name]['last_check'] = current_time
                         self.save_sites()
 
+                        # Track how long one full lap over every enabled
+                        # site takes — the number you actually asked for.
+                        if self.cycle_start == 0:
+                            self.cycle_start = current_time
+                        self.cycle_checked.add(site_name)
+                        enabled_names = {n for n, c in self.sites.items() if c['enabled']}
+                        if enabled_names and self.cycle_checked >= enabled_names:
+                            cycle_dur = round(time.time() - self.cycle_start, 1)
+                            self.log(f"⏱️ Full scan ({len(enabled_names)} sites) took {cycle_dur}s")
+                            self.cycle_checked = set()
+                            self.cycle_start = 0
+
                     except Exception as e:
                         self.consecutive_errors += 1
                         self.site_errors[site_name] = self.site_errors.get(site_name, 0) + 1
@@ -733,7 +747,11 @@ class SiteWatcher:
                             except Exception as re_err:
                                 self.log(f"❌ Restart failed: {re_err}")
 
-            time.sleep(3)
+            # Was 3s — a site becoming eligible partway through this sleep
+            # had to wait for the whole next tick before being checked at
+            # all. 1s cuts that dead time without meaningfully increasing
+            # CPU/Telegram-polling load.
+            time.sleep(1)
 
 
 def main():
