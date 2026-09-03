@@ -175,8 +175,24 @@ class SiteWatcher:
                 continue
         return False
 
+    # Common third-party trackers/analytics that add network weight but
+    # contribute nothing to the quest content we extract.
+    _BLOCKED_DOMAINS = (
+        "google-analytics.com", "googletagmanager.com", "doubleclick.net",
+        "segment.com", "segment.io", "amplitude.com", "mixpanel.com",
+        "intercom.io", "sentry.io", "hotjar.com", "fullstory.com",
+        "facebook.net", "connect.facebook.net", "clarity.ms",
+    )
+
+    def _route_filter(self, route):
+        req = route.request
+        if req.resource_type in ("image", "media", "font"):
+            return route.abort()
+        if any(d in req.url for d in self._BLOCKED_DOMAINS):
+            return route.abort()
+        return route.continue_()
+
     def wait_for_quests(self, page):
-        """Wait for quest elements to appear. Returns True if found."""
         try:
             page.wait_for_selector(QUEST_NAME_SELECTOR, timeout=15000)
             return True
@@ -214,16 +230,17 @@ class SiteWatcher:
             if is_first_load:
                 self.log("🆕 Cold load (first time)...")
                 page = self.browser.new_page(viewport={"width": 1280, "height": 900})
-                # We only ever read text — block images/fonts/media so
-                # Chromium doesn't spend memory/CPU decoding and holding
-                # them. Safe: doesn't affect what text we can extract.
-                page.route(
-                    "**/*",
-                    lambda route: route.abort()
-                    if route.request.resource_type in ("image", "media", "font")
-                    else route.continue_()
-                )
-                page.goto(url, wait_until="load", timeout=60000)
+                # We only ever read text — block images/fonts/media plus
+                # common third-party trackers/analytics domains. Chromium
+                # never has to fetch/render them, and they were also making
+                # the "load" event (below) wait longer than necessary.
+                page.route("**/*", self._route_filter)
+                # domcontentloaded, not "load": wait_for_quests() below does
+                # a real selector-based readiness check anyway, so we don't
+                # need to also wait for every last background request
+                # (trackers, websockets, etc.) to settle first — that was
+                # pure added latency on a JS-heavy SPA.
+                page.goto(url, wait_until="domcontentloaded", timeout=60000)
                 self.dismiss_cookie(page)
 
                 if self.is_rate_limited(page):
@@ -238,7 +255,7 @@ class SiteWatcher:
                 # Reload the existing warm tab — much faster, cookie already accepted
                 page = self.pages[site_name]
                 self.log("🔄 Reloading warm tab...")
-                page.reload(wait_until="load", timeout=60000)
+                page.reload(wait_until="domcontentloaded", timeout=60000)
 
                 if self.is_rate_limited(page):
                     return [], True, round(time.time() - t0), True
