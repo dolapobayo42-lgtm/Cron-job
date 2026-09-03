@@ -25,6 +25,12 @@ HAS_PERSISTENT_STORAGE = os.getenv("DATA_DIR") is not None
 # that growth so it can't OOM-kill the container. Default: every hour.
 BROWSER_RESTART_SECONDS = int(os.getenv("BROWSER_RESTART_SECONDS", "3600"))
 
+# If true: each check closes its tab immediately after reading, instead of
+# keeping tabs open. Bounds peak memory to ~1 tab regardless of site count —
+# trades a bit of extra time per check (fresh load vs fast reload) for much
+# lower steady-state RAM. Worth trying if you're memory-constrained.
+SEQUENTIAL_TABS = os.getenv("SEQUENTIAL_TABS", "false").lower() == "true"
+
 # Start with NO sites — add them manually via /add once the bot is running.
 DEFAULT_SITES = {}
 
@@ -195,8 +201,11 @@ class SiteWatcher:
         Returns (quests, rate_limited, duration_seconds, ready).
         `ready` is False when the quest elements never showed up in time —
         callers must treat that as a FAILED read, not "0 quests now".
-        First call: cold load + cookie dismiss.
-        Subsequent calls: fast reload on the same tab — no new page, no cookie banner.
+
+        SEQUENTIAL_TABS=true (env var): closes the tab after every check
+        instead of keeping it open, so peak memory stays ~1 tab's worth no
+        matter how many sites are being watched. Costs a bit of extra time
+        per check (fresh page load vs a fast reload).
         """
         t0 = time.time()
         is_first_load = site_name not in self.pages
@@ -205,6 +214,15 @@ class SiteWatcher:
             if is_first_load:
                 self.log("🆕 Cold load (first time)...")
                 page = self.browser.new_page(viewport={"width": 1280, "height": 900})
+                # We only ever read text — block images/fonts/media so
+                # Chromium doesn't spend memory/CPU decoding and holding
+                # them. Safe: doesn't affect what text we can extract.
+                page.route(
+                    "**/*",
+                    lambda route: route.abort()
+                    if route.request.resource_type in ("image", "media", "font")
+                    else route.continue_()
+                )
                 page.goto(url, wait_until="load", timeout=60000)
                 self.dismiss_cookie(page)
 
@@ -240,6 +258,12 @@ class SiteWatcher:
             quests = self.extract_quests(page)
             duration = round(time.time() - t0)
             self.log(f"📝 {len(quests)} quests in {duration}s (ready={ready})")
+
+            if SEQUENTIAL_TABS:
+                # Free this tab's memory immediately instead of keeping it
+                # warm — next check for this site will do a fresh cold load.
+                self.close_page(site_name)
+
             return quests, False, duration, ready
 
         except Exception as e:
