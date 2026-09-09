@@ -251,7 +251,7 @@ class SiteWatcher:
                     return [], True, round(time.time() - t0), True
 
                 ready = self.wait_for_quests(page)
-                time.sleep(0.5)
+                time.sleep(0.15)
                 self.pages[site_name] = page
             else:
                 # Reload the existing warm tab — much faster, cookie already accepted
@@ -263,7 +263,7 @@ class SiteWatcher:
                     return [], True, round(time.time() - t0), True
 
                 ready = self.wait_for_quests(page)
-                time.sleep(0.5)
+                time.sleep(0.15)
 
             if self.is_rate_limited(page):
                 return [], True, round(time.time() - t0), True
@@ -272,7 +272,7 @@ class SiteWatcher:
                 # One retry: give the SPA a bit more time before giving up.
                 self.log("⏳ Retrying wait once before treating as failed read...")
                 ready = self.wait_for_quests(page)
-                time.sleep(0.5)
+                time.sleep(0.15)
 
             quests = self.extract_quests(page)
             duration = round(time.time() - t0)
@@ -449,6 +449,23 @@ class SiteWatcher:
         elif cmd == "/resume":
             self.paused = False
             self.send_text("▶️ Checks resumed.")
+
+        elif cmd == "/interval":
+            if len(parts) < 3:
+                self.send_text("Usage: /interval <name> <seconds>\nExample: /interval minebit 1")
+                return
+            name = parts[1].lower().strip()
+            if name not in self.sites:
+                self.send_text(f"⚠️ '{name}' not found. Use /list to see sites.")
+                return
+            try:
+                secs = int(parts[2].strip())
+            except ValueError:
+                self.send_text("⚠️ Seconds must be a number.")
+                return
+            self.sites[name]['interval'] = secs
+            self.save_sites()
+            self.send_text(f"✅ {name} interval set to {secs}s")
 
         elif cmd == "/add":
             if len(parts) < 3:
@@ -751,7 +768,7 @@ class SiteWatcher:
             # had to wait for the whole next tick before being checked at
             # all. 1s cuts that dead time without meaningfully increasing
             # CPU/Telegram-polling load.
-            time.sleep(1)
+            time.sleep(0.3)
 
 
 def main():
@@ -769,3 +786,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
