@@ -724,7 +724,7 @@ class SiteWatcher:
                                     alert += "\n".join(f"• {q}" for q in removed)
                                 self.send_text(alert)
                             else:
-                                self.log(" No changes")
+                                self.log("✅ No changes")
 
                         self.sites[site_name]['last_check'] = current_time
                         self.save_sites()
@@ -786,4 +786,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
